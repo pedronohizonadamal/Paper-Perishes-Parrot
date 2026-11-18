@@ -1,4 +1,4 @@
-# Paper-Perishes-Parrot                                                                                                                                                                                                          ⌂ 20:58
+# Paper-Perishes-Parrot                                                                                                                                                                                                          
 
 CAN frame:
 field 0: SoF (start of frame), 1 bit, 0 dominant (bit stuffing starts)
