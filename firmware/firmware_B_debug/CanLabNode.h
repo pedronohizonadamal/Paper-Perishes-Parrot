@@ -1,0 +1,436 @@
+#ifndef CANLAB_NODE_H
+#define CANLAB_NODE_H
+#include <SPI.h>
+#include <EEPROM.h>
+#include <mcp2515_can.h>
+#include "Protocol.h"
+
+// Match the settings that already work with the Seeed demo on YOUR shields.
+const uint8_t CAN_CS = 9;
+const uint8_t CAN_CLOCK = MCP_16MHz;
+const uint32_t CAN_SPEED = CAN_500KBPS;
+const uint32_t SERIAL_SPEED = 115200;
+#ifndef CANLAB_DEBUG
+#define CANLAB_DEBUG 0
+#endif
+#ifndef CANLAB_SAMPLE_INTERVAL_MS
+#define CANLAB_SAMPLE_INTERVAL_MS Lab::SAMPLE_MS
+#endif
+#ifndef CANLAB_STALE_INTERVAL_MS
+#define CANLAB_STALE_INTERVAL_MS Lab::STALE_MS
+#endif
+#if NODE_ROLE_A
+const char ROLE = 'A';
+const uint16_t OWN_ID = Lab::MOTOR_ID;
+#else
+const char ROLE = 'B';
+const uint16_t OWN_ID = Lab::SENSOR_ID;
+#endif
+mcp2515_can can(CAN_CS);
+
+struct Counters {
+  uint32_t rx, queued, txOk, txFail, txTimeout, bad, unrelated;
+  uint32_t duplicate, old, missing, ownId, zeros, overflow, stale, ack;
+} counts = {};
+bool ready = false, txBusy = false, halted = false;
+bool haveSample = false, linkFresh = false;
+bool paused = false, invalidSensor = false, replyPending = false;
+uint32_t txStarted = 0, lastInit = 0, lastDiag = 0, lastStats = 0;
+uint32_t lastSampleAt = 0, lastAckAt = 0, lastSendAt = 0;
+uint16_t bootSession = 0, peerSession = 0, lastSeq = 0, nextSeq = 0;
+uint16_t distanceCm = 0, lastPublishedSession = 0;
+uint8_t motorState = Lab::STOP;
+uint8_t previousErrorState = 0xff;
+bool haveAck = false, ackTimedOut = false, abortRequested = false;
+uint8_t publishedFault = 0;
+
+#if CANLAB_DEBUG
+uint8_t regRead(uint8_t address);
+// MCP2515 exposes a validated, de-stuffed logical frame to the host. The
+// following helpers reconstruct the Classical CAN 2.0A bit fields, CRC-15 and
+// bit stuffing expected on the wire. They are not a substitute for a scope:
+// the actual sampled CRC bits, ACK slot and analog waveform are not readable
+// through readMsgBuf().
+uint16_t debugCrcBit(uint16_t crc, uint8_t bit) {
+  const bool feedback = ((crc >> 14) & 1U) != (bit != 0);
+  crc = uint16_t((crc << 1) & 0x7fffU);
+  return feedback ? uint16_t(crc ^ 0x4599U) : crc;
+}
+uint16_t debugCrcField(uint16_t crc, uint32_t value, uint8_t width) {
+  while (width) crc = debugCrcBit(crc, uint8_t(value >> --width) & 1U);
+  return crc;
+}
+uint16_t debugFrameCrc(uint16_t id, bool rtr, uint8_t dlc,
+                       const uint8_t *data) {
+  uint16_t crc = 0;
+  crc = debugCrcField(crc, 0, 1);       // SOF
+  crc = debugCrcField(crc, id, 11);     // standard identifier
+  crc = debugCrcField(crc, rtr, 1);
+  crc = debugCrcField(crc, 0, 1);       // IDE
+  crc = debugCrcField(crc, 0, 1);       // r0
+  crc = debugCrcField(crc, dlc & 0x0fU, 4);
+  if (!rtr) for (uint8_t i = 0; i < dlc; ++i)
+    crc = debugCrcField(crc, data[i], 8);
+  return crc;
+}
+void debugPrintBits(uint32_t value, uint8_t width) {
+  while (width) Serial.print(char('0' + ((value >> --width) & 1U)));
+}
+void debugPrintHexByte(uint8_t value) {
+  if (value < 0x10) Serial.print('0');
+  Serial.print(value, HEX);
+}
+struct DebugStuffPrinter {
+  bool have;
+  uint8_t last, run;
+  uint16_t bits;
+  DebugStuffPrinter() : have(false), last(0), run(0), bits(0) {}
+  void put(uint8_t bit) {
+    Serial.print(char('0' + bit)); ++bits;
+    if (!have || bit != last) { have = true; last = bit; run = 1; }
+    else ++run;
+    if (run == 5) {
+      const uint8_t stuffed = uint8_t(!bit);
+      Serial.print(char('0' + stuffed)); ++bits;
+      last = stuffed; run = 1;
+    }
+  }
+  void field(uint32_t value, uint8_t width) {
+    while (width) put(uint8_t(value >> --width) & 1U);
+  }
+};
+void debugPrintStuffed(uint16_t id, bool rtr, uint8_t dlc,
+                       const uint8_t *data, uint16_t crc) {
+  DebugStuffPrinter out;
+  out.field(0, 1); out.field(id, 11); out.field(rtr, 1);
+  out.field(0, 1); out.field(0, 1); out.field(dlc & 0x0fU, 4);
+  if (!rtr) for (uint8_t i = 0; i < dlc; ++i) out.field(data[i], 8);
+  out.field(crc, 15);
+  Serial.print(F(" (")); Serial.print(out.bits); Serial.print(F(" bits)"));
+}
+void debugFrame(const char *direction, uint32_t id, bool ext, bool rtr,
+                uint8_t dlc, const uint8_t *data) {
+  Serial.print(F("CAN_LOW_LEVEL ")); Serial.print(direction);
+  Serial.print(F(" t_ms=")); Serial.println(millis());
+  Serial.print(F("  FRAME_FORMAT="));
+  Serial.print(ext ? F("EXTENDED_29_BIT") : F("STANDARD_11_BIT"));
+  Serial.print(F(" TYPE=")); Serial.println(rtr ? F("REMOTE") : F("DATA"));
+  Serial.print(F("  SOF=0 ID=0x")); Serial.print(id, HEX);
+  Serial.print(F(" ID_BITS=")); debugPrintBits(id, ext ? 29 : 11);
+  Serial.print(F(" RTR=")); Serial.print(rtr ? 1 : 0);
+  Serial.print(F(" IDE=")); Serial.print(ext ? 1 : 0);
+  Serial.print(F(" r0=0 DLC=")); Serial.print(dlc);
+  Serial.print(F(" DLC_BITS=")); debugPrintBits(dlc & 0x0fU, 4);
+  Serial.print('\n');
+  Serial.print(F("  DATA_HEX="));
+  if (rtr || !dlc) Serial.print(F("<none>"));
+  else for (uint8_t i = 0; i < dlc; ++i) {
+    if (i) Serial.print(' ');
+    debugPrintHexByte(data[i]);
+  }
+  Serial.print(F(" DATA_BITS="));
+  if (rtr || !dlc) Serial.print(F("<none>"));
+  else for (uint8_t i = 0; i < dlc; ++i) debugPrintBits(data[i], 8);
+  Serial.print('\n');
+  if (!ext && dlc <= 8) {
+    const uint16_t crc = debugFrameCrc(uint16_t(id), rtr, dlc, data);
+    Serial.print(F("  CRC15_RECONSTRUCTED=0x")); Serial.print(crc, HEX);
+    Serial.print(F(" CRC_BITS=")); debugPrintBits(crc, 15);
+    Serial.print(F(" CRC_DELIMITER=1\n  WIRE_SOF_TO_CRC_STUFFED="));
+    debugPrintStuffed(uint16_t(id), rtr, dlc, data, crc);
+    Serial.print('\n');
+  } else {
+    Serial.print(F("  CRC/STUFFING_RECONSTRUCTION=unsupported_for_extended_frame\n"));
+  }
+  Serial.print(F("  ACK_SLOT=controller_managed ACK_DELIMITER=1 EOF=1111111 IFS=111\n"));
+  Serial.print(F("  NOTE=logical_frame_plus_reconstruction_not_physical_capture\n"));
+}
+void debugTxResult(bool ok, uint8_t ctrl) {
+  Serial.print(F("CAN_LOW_LEVEL TX_RESULT t_ms=")); Serial.print(millis());
+  Serial.print(F(" result=")); Serial.print(ok ? F("TX_OK") : F("TX_ERROR_OR_ABORT"));
+  Serial.print(F(" ACK=")); Serial.print(ok ? F("dominant_observed") : F("not_confirmed"));
+  Serial.print(F(" TX0CTRL=0x")); Serial.print(ctrl, HEX);
+  Serial.print(F(" EFLG=0x")); Serial.print(regRead(0x2d), HEX);
+  Serial.print(F(" TEC=")); Serial.print(regRead(0x1c));
+  Serial.print(F(" REC=")); Serial.println(regRead(0x1d));
+}
+#endif
+
+// MCP2515 documented SPI commands. All access is in loop(), never an ISR.
+// This supplements Seeed with read-only TEC/REC/status observations.
+uint8_t regRead(uint8_t address) {
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(CAN_CS, LOW); SPI.transfer(0x03); SPI.transfer(address);
+  uint8_t value = SPI.transfer(0);
+  digitalWrite(CAN_CS, HIGH); SPI.endTransaction(); return value;
+}
+void regModify(uint8_t address, uint8_t mask, uint8_t value) {
+  SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(CAN_CS, LOW); SPI.transfer(0x05); SPI.transfer(address);
+  SPI.transfer(mask); SPI.transfer(value);
+  digitalWrite(CAN_CS, HIGH); SPI.endTransaction();
+}
+void event(const __FlashStringHelper *message) {
+  Serial.print(millis()); Serial.print(' '); Serial.print(ROLE);
+  Serial.print(' '); Serial.println(message);
+}
+void printRegisters() {
+  Serial.print(F("EFLG=0x")); Serial.print(regRead(0x2d), HEX);
+  Serial.print(F(" TEC=")); Serial.print(regRead(0x1c));
+  Serial.print(F(" REC=")); Serial.print(regRead(0x1d));
+  Serial.print(F(" TX0CTRL=0x")); Serial.println(regRead(0x30), HEX);
+}
+void printStats() {
+  Serial.print(F("STATS ")); Serial.print(ROLE);
+  Serial.print(F(" rx=")); Serial.print(counts.rx);
+  Serial.print(F(" queued=")); Serial.print(counts.queued);
+  Serial.print(F(" tx_ok=")); Serial.print(counts.txOk);
+  Serial.print(F(" tx_fail=")); Serial.print(counts.txFail);
+  Serial.print(F(" tx_deadline=")); Serial.print(counts.txTimeout);
+  Serial.print(F(" bad=")); Serial.print(counts.bad);
+  Serial.print(F(" duplicate=")); Serial.print(counts.duplicate);
+  Serial.print(F(" old=")); Serial.print(counts.old);
+  Serial.print(F(" missing=")); Serial.print(counts.missing);
+  Serial.print(F(" own_id=")); Serial.print(counts.ownId);
+  Serial.print(F(" zero=")); Serial.print(counts.zeros);
+  Serial.print(F(" rx_overflow=")); Serial.print(counts.overflow);
+  Serial.print(F(" stale=")); Serial.print(counts.stale);
+  Serial.print(F(" app_ack=")); Serial.println(counts.ack);
+  if (ready) printRegisters();
+}
+bool initializeCan() {
+  // D10 must remain OUTPUT on AVR UNO (SPI master), and deselect SD (D4).
+  pinMode(10, OUTPUT); digitalWrite(10, HIGH);
+  pinMode(4, OUTPUT); digitalWrite(4, HIGH);
+  if (can.begin(CAN_SPEED, CAN_CLOCK) != CAN_OK) {
+    event(F("CAN_INIT_FAIL: check CS, oscillator and shield seating"));
+    return false;
+  }
+  if (can.setMode(MODE_NORMAL) != CAN_OK) return false;
+  // Zero masks accept all IDs, including OWN_ID. Software rejects EXT and RTR.
+  // Must NOT filter out OWN_ID: the future Parrot owner must see spoofed IDs.
+  if (can.init_Mask(0, 0, 0) != CAN_OK ||
+      can.init_Mask(1, 0, 0) != CAN_OK) return false;
+  for (uint8_t i = 0; i < 6; ++i)
+    if (can.init_Filt(i, 0, 0) != CAN_OK) return false;
+  // RXM=00: use filters; BUKT enabled to permit RXB0 rollover.
+  regModify(0x60, 0x64, 0x04); regModify(0x70, 0x60, 0);
+  regModify(0x2c, 0x04, 0); // TX0IF clear; only TX buffer 0 is used.
+  txBusy = false; halted = false; abortRequested = false; previousErrorState = 0xff;
+  event(F("CAN_READY classic standard-11bit 500k DLC8"));
+  return true;
+}
+void serviceTx(uint32_t now) {
+  if (!txBusy) return;
+  const uint8_t ctrl = regRead(0x30);
+  if (!(ctrl & 0x08)) { // TXREQ cleared: examine completion, not just enqueue.
+    const bool ok = (regRead(0x2c) & 0x04) && !(ctrl & 0x50);
+    if (ok) ++counts.txOk;
+    else ++counts.txFail;
+#if CANLAB_DEBUG
+    debugTxResult(ok, ctrl);
+#endif
+    regModify(0x2c, 0x04, 0); txBusy = false;
+  } else if (!abortRequested && Lab::elapsed(now, txStarted, Lab::TX_DEADLINE_MS)) {
+    // ABAT requests an orderly controller abort, NOT an injected error frame.
+    // Leave asserted until TXREQ actually clears; never reuse a pending buffer.
+    regModify(0x0f, 0x10, 0x10);
+    ++counts.txTimeout; event(F("TX_DEADLINE: abort pending sample"));
+    abortRequested = true;
+  }
+  if (!txBusy) { regModify(0x0f, 0x10, 0); abortRequested = false; }
+}
+bool queueFrame(uint16_t id, uint8_t dlc, const uint8_t *data) {
+  if (!ready || halted || txBusy) return false;
+#if CANLAB_DEBUG
+  debugFrame("TX_REQUEST", id, false, false, dlc, data);
+#endif
+  regModify(0x2c, 0x04, 0);
+  // CAN_OK here means QUEUED; serviceTx checks actual controller completion.
+  if (can.trySendMsgBuf(id, 0, 0, dlc, data, 0) != CAN_OK) {
+    ++counts.txFail; return false;
+  }
+  txBusy = true; txStarted = millis(); ++counts.queued; return true;
+}
+void diagnostics(uint32_t now) {
+  if (!Lab::elapsed(now, lastDiag, 10)) return;
+  lastDiag = now;
+  const uint8_t flags = regRead(0x2d);
+  const uint8_t state = flags & 0x3f;
+  if (state != previousErrorState) {
+    previousErrorState = state;
+    event(F("CAN_STATE_CHANGED")); printRegisters();
+    if (flags & 0x20) event(F("CAN_BUS_OFF"));
+    else if (flags & 0x18) event(F("CAN_ERROR_PASSIVE"));
+    else event(F("CAN_ERROR_ACTIVE"));
+    if (flags & 0x07) event(F("CAN_ERROR_WARNING"));
+  }
+  if (flags & 0xc0) {
+    ++counts.overflow;
+    event(F("RX_OVERFLOW: at least one frame lost"));
+    regModify(0x2d, 0xc0, 0); // Clear ONLY the two software-clearable overflow bits.
+  }
+  if ((flags & 0x20) && !halted) {
+    halted = true; motorState = Lab::STOP;
+    event(F("BUS_OFF_OBSERVED: application TX halted; use r to reinitialize"));
+    // MCP2515 can still recover autonomously; this is an application latch only.
+  }
+}
+void publishMotor() {
+  Serial.print(F("MOTOR "));
+  if (motorState == Lab::RUN) Serial.print(F("RUN"));
+  else if (motorState == Lab::SENSOR_FAULT) Serial.print(F("STOP_SENSOR_FAULT"));
+  else Serial.print(F("STOP"));
+  Serial.print(F(" cm=")); Serial.print(distanceCm);
+  Serial.print(F(" seq=")); Serial.println(lastSeq);
+}
+void receiveSensor(const uint8_t *data, uint32_t now) {
+  if (!Lab::validSensor(data)) { ++counts.bad; event(F("BAD_SENSOR_PAYLOAD")); return; }
+  const uint16_t session = Lab::u16(data + 6), seq = Lab::u16(data + 1);
+  const bool sameSession = haveSample && session == peerSession;
+  const Lab::Order ord = Lab::order(sameSession, lastSeq, seq);
+  if (ord == Lab::DUPLICATE) { ++counts.duplicate; return; }
+  if (ord == Lab::OLD) { ++counts.old; return; }
+  if (ord == Lab::FORWARD) counts.missing += uint16_t(seq - lastSeq) - 1U;
+  if (!sameSession) event(F("SENSOR_SESSION_CHANGE: resync (not authentication)"));
+  haveSample = true; peerSession = session; lastSeq = seq;
+  distanceCm = Lab::u16(data + 3); lastSampleAt = now;
+  if (!linkFresh) event(F("SENSOR_LINK_UP"));
+  linkFresh = true;
+  motorState = halted ? Lab::STOP : data[5] ? Lab::SENSOR_FAULT :
+    (distanceCm <= Lab::STOP_CM ? Lab::STOP : Lab::RUN);
+  publishMotor(); replyPending = true;
+}
+void receiveStatus(const uint8_t *data, uint32_t now) {
+  if (!Lab::validStatus(data)) { ++counts.bad; return; }
+  // This confirms only the most recently QUEUED sample in this low-load test.
+  // Session/sequence are diagnostics, not identity or anti-replay credentials.
+  if (!haveSample || Lab::u16(data + 6) != lastPublishedSession ||
+      Lab::u16(data + 1) != lastSeq || Lab::u16(data + 3) != distanceCm ||
+      data[5] != (publishedFault ? Lab::SENSOR_FAULT :
+        (distanceCm <= Lab::STOP_CM ? Lab::STOP : Lab::RUN))) {
+    ++counts.old; return;
+  }
+  if (haveAck) { ++counts.duplicate; return; }
+  haveAck = true; ackTimedOut = false; lastAckAt = now; ++counts.ack;
+  if (!linkFresh) event(F("APPLICATION_LINK_UP"));
+  linkFresh = true;
+  Serial.print(F("APP_ACK seq=")); Serial.print(lastSeq);
+  Serial.print(F(" motor=")); Serial.println(data[5]);
+}
+void receiveFrames(uint32_t now) {
+  // Bound work per loop so a busy bus cannot starve watchdogs or diagnostics.
+  for (uint8_t n = 0; n < 8 && can.checkReceive() == CAN_MSGAVAIL; ++n) {
+    uint8_t len = 0, data[8] = {};
+    if (can.readMsgBuf(&len, data) != CAN_OK) { ++counts.bad; continue; }
+    const uint32_t id = can.getCanId();
+    const bool ext = can.isExtendedFrame(), rtr = can.isRemoteRequest();
+    ++counts.rx;
+#if CANLAB_DEBUG
+    debugFrame("RX_DECODED", id, ext, rtr, len, data);
+#endif
+    if (ext || rtr) { ++counts.bad; continue; }
+    if (id == OWN_ID) {
+      ++counts.ownId;
+      event(F("OWN_ID_RX: possible spoof; monitor only, Parrot OFF"));
+      continue;
+    }
+    const uint16_t expected = NODE_ROLE_A ? Lab::SENSOR_ID : Lab::MOTOR_ID;
+    if (id != expected) { ++counts.unrelated; continue; }
+    if (len != Lab::DLC) { ++counts.bad; event(F("BAD_DLC")); continue; }
+    if (Lab::allZero(data)) {
+      ++counts.zeros; event(F("ZERO_RESERVED: possible future Dmessage"));
+      // A must not interpret Parrot all-zero traffic as distance=0 or version=0.
+      // Hold STOP until a NEW valid sample arrives; do not refresh freshness.
+      if (NODE_ROLE_A) { motorState = Lab::STOP; publishMotor(); }
+      continue;
+    }
+#if NODE_ROLE_A
+    receiveSensor(data, now);
+#else
+    receiveStatus(data, now);
+#endif
+  }
+}
+void serviceApplication(uint32_t now) {
+#if NODE_ROLE_A
+  if (haveSample && linkFresh && Lab::elapsed(now, lastSampleAt, CANLAB_STALE_INTERVAL_MS)) {
+    linkFresh = false; motorState = Lab::STOP; replyPending = false;
+    ++counts.stale; event(F("SENSOR_TIMEOUT -> MOTOR STOP")); publishMotor();
+  }
+  if (replyPending && !halted) {
+    uint8_t frame[8]; Lab::encode(frame, lastSeq, distanceCm, motorState, peerSession);
+    if (queueFrame(Lab::MOTOR_ID, 8, frame)) replyPending = false;
+  }
+#else
+  if (haveSample && !ackTimedOut && Lab::elapsed(now, lastAckAt, CANLAB_STALE_INTERVAL_MS)) {
+    ackTimedOut = true; linkFresh = false; ++counts.stale; event(F("APPLICATION_ACK_TIMEOUT"));
+  }
+  if (!paused && !halted && Lab::elapsed(now, lastSendAt, CANLAB_SAMPLE_INTERVAL_MS)) {
+    lastSendAt = now;
+    uint8_t frame[8]; const uint16_t cm = Lab::simulatedDistance(nextSeq);
+    Lab::encode(frame, nextSeq, cm, invalidSensor ? 1 : 0, bootSession);
+    if (queueFrame(Lab::SENSOR_ID, 8, frame)) {
+      if (!haveSample) { lastAckAt = now; ackTimedOut = false; }
+      lastSeq = nextSeq++; distanceCm = cm; lastPublishedSession = bootSession;
+      publishedFault = invalidSensor ? 1 : 0;
+      haveSample = true; haveAck = false;
+    }
+  }
+#endif
+}
+void help() {
+  event(F("h help | s stats | r reinitialize controller (clears TEC/REC)"));
+#if !NODE_ROLE_A
+  event(F("B: p pause/resume | i toggle sensor-fault | z zero | d duplicate | o old | m bad-DLC"));
+  event(F("For d/o/m/z: p first, wait >=250ms, then send one command"));
+#endif
+}
+void commands() {
+  if (!Serial.available()) return;
+  const char c = Serial.read();
+  if (c == 'h') help();
+  if (c == 's') printStats();
+  if (c == 'r') {
+    motorState = Lab::STOP; linkFresh = false; haveSample = false;
+    replyPending = false; haveAck = false;
+    ready = initializeCan(); lastInit = millis();
+    event(F("MANUAL_RESET: controller counters reset; software totals retained"));
+  }
+#if !NODE_ROLE_A
+  if (c == 'p') { paused = !paused; event(paused ? F("SENSOR_PAUSED") : F("SENSOR_RESUMED")); }
+  if (c == 'i') { invalidSensor = !invalidSensor; event(invalidSensor ? F("SENSOR_FAULT_ON") : F("SENSOR_FAULT_OFF")); }
+  if (c == 'z' || c == 'd' || c == 'o' || c == 'm') {
+    if (!paused || !haveSample) { event(F("FAULT_TEST: pause B after at least one sample first")); return; }
+    uint8_t frame[8] = {};
+    if (c != 'z') Lab::encode(frame, c == 'o' ? uint16_t(lastSeq - 1) : lastSeq,
+                              distanceCm, invalidSensor ? 1 : 0, bootSession);
+    event(queueFrame(Lab::SENSOR_ID, c == 'm' ? 3 : 8, frame) ?
+          F("TEST_FRAME_QUEUED") : F("TEST_FRAME_BUSY_OR_HALTED"));
+  }
+#endif
+}
+void setup() {
+  Serial.begin(SERIAL_SPEED);
+  // Diagnostic boot number only; two EEPROM bytes reserved at addresses 0..1.
+  // Not a cryptographic nonce and not atomic under power loss during EEPROM write.
+  EEPROM.get(0, bootSession);
+  bootSession = (bootSession == 0xffffU || bootSession == 0xfffeU) ? 1 : uint16_t(bootSession + 1);
+  if (!bootSession) bootSession = 1;
+  EEPROM.put(0, bootSession);
+  event(F("CAN LAB BASELINE v1: no authentication, no Parrot defense"));
+#if CANLAB_DEBUG
+  event(F("DEBUG CAN: 10s samples; logical fields plus reconstructed CRC/stuffing"));
+#endif
+  ready = initializeCan(); lastInit = millis(); help();
+}
+void loop() {
+  uint32_t now = millis(); commands();
+  if (!ready) {
+    if (Lab::elapsed(now, lastInit, 2000)) { lastInit = now; ready = initializeCan(); }
+    return;
+  }
+  diagnostics(now); serviceTx(now); receiveFrames(now); serviceApplication(millis());
+  if (Lab::elapsed(millis(), lastStats, 2000)) { lastStats = millis(); printStats(); }
+}
+#endif
