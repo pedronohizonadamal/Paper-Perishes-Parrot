@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Paper-Perishes-Parrot
 
 Firmware base: `firmware/A_Motor` y `firmware/B_Sensor`.
@@ -11,8 +10,6 @@ Nodo atacante C para el experimento previo a Parrot: `firmware/C_Attacker`.
 Su guía explica el modelo de amenaza, los comandos serie y la evidencia que debe
 recogerse antes y después de activar la defensa.
 =======
-# Paper-Perishes-Parrot                                                                                                                                                                                                          
-
 CAN frame:
 
 field 0: SoF (start of frame), 1 bit, 0 dominant (bit stuffing starts)
@@ -32,4 +29,4 @@ field 6: ACK (acknowledgement), 1 bit ACK (Recessive when sent, Dominant after r
 field 7: EOF (end of frame), 7 consecutive recessive bits
 
 field "8": Intermission field, 3 recessive bits between frames
->>>>>>> 8a10720dfc90e257ea3c42093de9f0870d5b5c37
+
