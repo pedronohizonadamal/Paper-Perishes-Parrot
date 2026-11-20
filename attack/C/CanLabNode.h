@@ -1,5 +1,6 @@
 #ifndef CANLAB_NODE_H
 #define CANLAB_NODE_H
+#include <Arduino.h>
 #include <SPI.h>
 #include <EEPROM.h>
 #include <mcp2515_can.h>
@@ -13,7 +14,6 @@
 #endif
 #endif
 
-// Match the settings that already work with the Seeed demo on YOUR shields.
 const uint8_t CAN_CS = 9;
 const uint8_t CAN_CLOCK = MCP_16MHz;
 const uint32_t CAN_SPEED = CAN_500KBPS;
@@ -27,40 +27,38 @@ const char ROLE = 'B';
 const uint16_t OWN_ID = Lab::SENSOR_ID;
 #else
 const char ROLE = 'C';
-const uint16_t OWN_ID = 0x320;
+const uint16_t OWN_ID = Lab::ATTACKER_ID;
 #endif
 
 mcp2515_can can(CAN_CS);
 
 struct Counters {
   uint32_t rx, queued, txOk, txFail, txTimeout, bad, unrelated;
-  uint32_t duplicate, old, missing, ownId, zeros, overflow, stale, ack, spoofTx;
+  uint32_t duplicate, old, missing, zeros, overflow, stale, ack, txCustom;
 } counts = {};
 
 bool ready = false, txBusy = false, halted = false;
 bool haveSample = false, linkFresh = false;
 bool paused = false, invalidSensor = false, replyPending = false;
-bool spoofActive = false;
-uint8_t busOffBurstRemaining = 0; // remaining frames in a Bus-Off test burst
-bool busOffBurstZeros = false;    // true = 0x00 fill, false = 0xFF fill
+bool periodicTxActive = false;
 
 uint32_t txStarted = 0, lastInit = 0, lastDiag = 0, lastStats = 0;
-uint32_t lastSampleAt = 0, lastAckAt = 0, lastSendAt = 0, lastSpoofAt = 0;
+uint32_t lastSampleAt = 0, lastAckAt = 0, lastSendAt = 0, lastPeriodicAt = 0;
 uint16_t bootSession = 0, peerSession = 0, lastSeq = 0, nextSeq = 0;
-uint16_t spoofSeq = 1;
+uint16_t customSeq = 1;
 uint16_t distanceCm = 0, lastPublishedSession = 0;
 uint8_t motorState = Lab::STOP;
 uint8_t previousErrorState = 0xff;
 bool haveAck = false, ackTimedOut = false, abortRequested = false;
 uint8_t publishedFault = 0;
 
-// MCP2515 documented SPI commands. All access is in loop(), never an ISR.
-// This supplements Seeed with read-only TEC/REC/status observations.
+// MCP2515 SPI register access (0x03 READ, 0x05 BIT MODIFY) in loop().
 uint8_t regRead(uint8_t address) {
   SPI.beginTransaction(SPISettings(8000000, MSBFIRST, SPI_MODE0));
   digitalWrite(CAN_CS, LOW); SPI.transfer(0x03); SPI.transfer(address);
   uint8_t value = SPI.transfer(0);
-  digitalWrite(CAN_CS, HIGH); SPI.endTransaction(); return value;
+  digitalWrite(CAN_CS, HIGH); SPI.endTransaction();
+  return value;
 }
 
 void regModify(uint8_t address, uint8_t mask, uint8_t value) {
@@ -89,12 +87,11 @@ void printStats() {
   Serial.print(F(" tx_ok=")); Serial.print(counts.txOk);
   Serial.print(F(" tx_fail=")); Serial.print(counts.txFail);
   Serial.print(F(" tx_deadline=")); Serial.print(counts.txTimeout);
-  Serial.print(F(" spoof_tx=")); Serial.print(counts.spoofTx);
+  Serial.print(F(" tx_custom=")); Serial.print(counts.txCustom);
   Serial.print(F(" bad=")); Serial.print(counts.bad);
   Serial.print(F(" duplicate=")); Serial.print(counts.duplicate);
   Serial.print(F(" old=")); Serial.print(counts.old);
   Serial.print(F(" missing=")); Serial.print(counts.missing);
-  Serial.print(F(" own_id=")); Serial.print(counts.ownId);
   Serial.print(F(" zero=")); Serial.print(counts.zeros);
   Serial.print(F(" rx_overflow=")); Serial.print(counts.overflow);
   Serial.print(F(" stale=")); Serial.print(counts.stale);
@@ -103,76 +100,67 @@ void printStats() {
 }
 
 bool initializeCan() {
-  // D10 must remain OUTPUT on AVR UNO (SPI master), and deselect SD (D4).
   pinMode(10, OUTPUT); digitalWrite(10, HIGH);
   pinMode(4, OUTPUT); digitalWrite(4, HIGH);
   if (can.begin(CAN_SPEED, CAN_CLOCK) != CAN_OK) {
-    event(F("CAN_INIT_FAIL: check CS, oscillator and shield seating"));
+    event(F("CAN_INIT_FAIL"));
     return false;
   }
   if (can.setMode(MODE_NORMAL) != CAN_OK) return false;
-  // Zero masks accept all IDs, including OWN_ID. Software rejects EXT and RTR.
-  // Must NOT filter out OWN_ID: the future Parrot owner must see spoofed IDs.
+  // Standard 11-bit frames; software checks IDE/RTR and message IDs.
   if (can.init_Mask(0, 0, 0) != CAN_OK ||
       can.init_Mask(1, 0, 0) != CAN_OK) return false;
   for (uint8_t i = 0; i < 6; ++i)
     if (can.init_Filt(i, 0, 0) != CAN_OK) return false;
-  // RXM=00: use filters; BUKT enabled to permit RXB0 rollover.
-  regModify(0x60, 0x64, 0x04); regModify(0x70, 0x60, 0);
-  regModify(0x2c, 0x04, 0); // TX0IF clear; only TX buffer 0 is used.
+  regModify(0x60, 0x64, 0x04);
+  regModify(0x70, 0x60, 0);
+  regModify(0x2c, 0x04, 0);
   txBusy = false; halted = false; abortRequested = false;
-  busOffBurstRemaining = 0; previousErrorState = 0xff;
-  event(F("CAN_READY classic standard-11bit 500k DLC8"));
+  previousErrorState = 0xff;
+  event(F("CAN_READY 11bit 500k DLC8"));
   return true;
 }
 
 void serviceTx(uint32_t now) {
   if (!txBusy) return;
   const uint8_t ctrl = regRead(0x30);
-  if (!(ctrl & 0x08)) { // TXREQ cleared: examine completion, not just enqueue.
+  if (!(ctrl & 0x08)) {
     if ((regRead(0x2c) & 0x04) && !(ctrl & 0x50)) ++counts.txOk;
     else ++counts.txFail;
-    regModify(0x2c, 0x04, 0); txBusy = false;
+    regModify(0x2c, 0x04, 0);
+    txBusy = false;
   } else if (!abortRequested && Lab::elapsed(now, txStarted, Lab::TX_DEADLINE_MS)) {
-    // ABAT requests an orderly controller abort, NOT an injected error frame.
-    // Leave asserted until TXREQ actually clears; never reuse a pending buffer.
     regModify(0x0f, 0x10, 0x10);
-    ++counts.txTimeout; event(F("TX_DEADLINE: abort pending sample"));
+    ++counts.txTimeout;
+    event(F("TX_DEADLINE"));
     abortRequested = true;
   }
-  if (!txBusy) { regModify(0x0f, 0x10, 0); abortRequested = false; }
+  if (!txBusy) {
+    regModify(0x0f, 0x10, 0);
+    abortRequested = false;
+  }
 }
 
 bool queueFrame(uint16_t id, uint8_t dlc, const uint8_t *data) {
   if (!ready || halted || txBusy) return false;
   regModify(0x2c, 0x04, 0);
-  // CAN_OK here means QUEUED; serviceTx checks actual controller completion.
   if (can.trySendMsgBuf(id, 0, 0, dlc, data, 0) != CAN_OK) {
-    ++counts.txFail; return false;
+    ++counts.txFail;
+    return false;
   }
-  txBusy = true; txStarted = millis(); ++counts.queued; return true;
+  txBusy = true;
+  txStarted = millis();
+  ++counts.queued;
+  return true;
 }
 
-void serviceBusOffBurst() {
-  if (!busOffBurstRemaining || halted || txBusy) return;
+bool sendStopSampleFrame() {
   uint8_t frame[8];
-  const uint8_t fill = busOffBurstZeros ? 0x00 : 0xFF;
-  for (uint8_t i = 0; i < 8; ++i) frame[i] = fill;
-  if (queueFrame(Lab::SENSOR_ID, Lab::DLC, frame)) {
-    --busOffBurstRemaining;
-    if (!busOffBurstZeros) ++counts.spoofTx;
-  }
-}
-
-bool sendSpoofStopFrame() {
-  uint8_t frame[8];
-  // Valid sensor payload format (version=1, cm<=5000, flags=0, session!=0)
-  // crafted with cm <= STOP_CM (10 <= 50) to force A into STOP.
-  Lab::encode(frame, spoofSeq, 10, 0, bootSession);
+  Lab::encode(frame, customSeq, Lab::SPOOF_STOP_CM, 0, bootSession);
   if (!queueFrame(Lab::SENSOR_ID, Lab::DLC, frame)) return false;
-  ++spoofSeq;
-  ++counts.spoofTx;
-  event(F("SPOOF_STOP_QUEUED id=0x120 cm=10"));
+  ++customSeq;
+  ++counts.txCustom;
+  event(F("TX_FRAME id=0x120 cm=10"));
   return true;
 }
 
@@ -183,7 +171,8 @@ void diagnostics(uint32_t now) {
   const uint8_t state = flags & 0x3f;
   if (state != previousErrorState) {
     previousErrorState = state;
-    event(F("CAN_STATE_CHANGED")); printRegisters();
+    event(F("CAN_STATE_CHANGED"));
+    printRegisters();
     if (flags & 0x20) event(F("CAN_BUS_OFF"));
     else if (flags & 0x18) event(F("CAN_ERROR_PASSIVE"));
     else event(F("CAN_ERROR_ACTIVE"));
@@ -191,14 +180,14 @@ void diagnostics(uint32_t now) {
   }
   if (flags & 0xc0) {
     ++counts.overflow;
-    event(F("RX_OVERFLOW: at least one frame lost"));
-    regModify(0x2d, 0xc0, 0); // Clear ONLY the two software-clearable overflow bits.
+    event(F("RX_OVERFLOW"));
+    regModify(0x2d, 0xc0, 0);
   }
   if ((flags & 0x20) && !halted) {
-    halted = true; motorState = Lab::STOP;
-    spoofActive = false; busOffBurstRemaining = 0;
-    event(F("BUS_OFF_OBSERVED: application TX halted; use r to reinitialize"));
-    // MCP2515 can still recover autonomously; this is an application latch only.
+    halted = true;
+    motorState = Lab::STOP;
+    periodicTxActive = false;
+    event(F("BUS_OFF"));
   }
 }
 
@@ -212,32 +201,31 @@ void publishMotor() {
 }
 
 void receiveSensor(const uint8_t *data, uint32_t now) {
-  if (!Lab::validSensor(data)) { ++counts.bad; event(F("BAD_SENSOR_PAYLOAD")); return; }
+  if (!Lab::validSensor(data)) { ++counts.bad; event(F("BAD_PAYLOAD")); return; }
   const uint16_t session = Lab::u16(data + 6), seq = Lab::u16(data + 1);
   const bool sameSession = haveSample && session == peerSession;
   const Lab::Order ord = Lab::order(sameSession, lastSeq, seq);
   if (ord == Lab::DUPLICATE) { ++counts.duplicate; return; }
   if (ord == Lab::OLD) { ++counts.old; return; }
   if (ord == Lab::FORWARD) counts.missing += uint16_t(seq - lastSeq) - 1U;
-  if (!sameSession) event(F("SENSOR_SESSION_CHANGE: resync (not authentication)"));
   haveSample = true; peerSession = session; lastSeq = seq;
   distanceCm = Lab::u16(data + 3); lastSampleAt = now;
   if (!linkFresh) event(F("SENSOR_LINK_UP"));
   linkFresh = true;
   motorState = halted ? Lab::STOP : data[5] ? Lab::SENSOR_FAULT :
     (distanceCm <= Lab::STOP_CM ? Lab::STOP : Lab::RUN);
-  publishMotor(); replyPending = true;
+  publishMotor();
+  replyPending = true;
 }
 
 void receiveStatus(const uint8_t *data, uint32_t now) {
   if (!Lab::validStatus(data)) { ++counts.bad; return; }
-  // This confirms only the most recently QUEUED sample in this low-load test.
-  // Session/sequence are diagnostics, not identity or anti-replay credentials.
   if (!haveSample || Lab::u16(data + 6) != lastPublishedSession ||
       Lab::u16(data + 1) != lastSeq || Lab::u16(data + 3) != distanceCm ||
       data[5] != (publishedFault ? Lab::SENSOR_FAULT :
         (distanceCm <= Lab::STOP_CM ? Lab::STOP : Lab::RUN))) {
-    ++counts.old; return;
+    ++counts.old;
+    return;
   }
   if (haveAck) { ++counts.duplicate; return; }
   haveAck = true; ackTimedOut = false; lastAckAt = now; ++counts.ack;
@@ -248,7 +236,6 @@ void receiveStatus(const uint8_t *data, uint32_t now) {
 }
 
 void receiveFrames(uint32_t now) {
-  // Bound work per loop so a busy bus cannot starve watchdogs or diagnostics.
   for (uint8_t n = 0; n < 8 && can.checkReceive() == CAN_MSGAVAIL; ++n) {
     uint8_t len = 0, data[8] = {};
     if (can.readMsgBuf(&len, data) != CAN_OK) { ++counts.bad; continue; }
@@ -256,19 +243,14 @@ void receiveFrames(uint32_t now) {
     const bool ext = can.isExtendedFrame(), rtr = can.isRemoteRequest();
     ++counts.rx;
     if (ext || rtr) { ++counts.bad; continue; }
-    if (id == OWN_ID) {
-      ++counts.ownId;
-      event(F("OWN_ID_RX: possible spoof; monitor only, Parrot OFF"));
-      continue;
-    }
 #if NODE_ROLE == 1
     if (id != Lab::SENSOR_ID) { ++counts.unrelated; continue; }
     if (len != Lab::DLC) { ++counts.bad; event(F("BAD_DLC")); continue; }
     if (Lab::allZero(data)) {
-      ++counts.zeros; event(F("ZERO_RESERVED: possible future Dmessage"));
-      // A must not interpret Parrot all-zero traffic as distance=0 or version=0.
-      // Hold STOP until a NEW valid sample arrives; do not refresh freshness.
-      motorState = Lab::STOP; publishMotor();
+      ++counts.zeros;
+      event(F("ZERO_DATA"));
+      motorState = Lab::STOP;
+      publishMotor();
       continue;
     }
     receiveSensor(data, now);
@@ -276,7 +258,8 @@ void receiveFrames(uint32_t now) {
     if (id != Lab::MOTOR_ID) { ++counts.unrelated; continue; }
     if (len != Lab::DLC) { ++counts.bad; event(F("BAD_DLC")); continue; }
     if (Lab::allZero(data)) {
-      ++counts.zeros; event(F("ZERO_RESERVED: possible future Dmessage"));
+      ++counts.zeros;
+      event(F("ZERO_DATA"));
       continue;
     }
     receiveStatus(data, now);
@@ -290,19 +273,21 @@ void serviceApplication(uint32_t now) {
 #if NODE_ROLE == 1
   if (haveSample && linkFresh && Lab::elapsed(now, lastSampleAt, Lab::STALE_MS)) {
     linkFresh = false; motorState = Lab::STOP; replyPending = false;
-    ++counts.stale; event(F("SENSOR_TIMEOUT -> MOTOR STOP")); publishMotor();
+    ++counts.stale; event(F("SENSOR_TIMEOUT")); publishMotor();
   }
   if (replyPending && !halted) {
-    uint8_t frame[8]; Lab::encode(frame, lastSeq, distanceCm, motorState, peerSession);
+    uint8_t frame[8];
+    Lab::encode(frame, lastSeq, distanceCm, motorState, peerSession);
     if (queueFrame(Lab::MOTOR_ID, 8, frame)) replyPending = false;
   }
 #elif NODE_ROLE == 2
   if (haveSample && !ackTimedOut && Lab::elapsed(now, lastAckAt, Lab::STALE_MS)) {
-    ackTimedOut = true; linkFresh = false; ++counts.stale; event(F("APPLICATION_ACK_TIMEOUT"));
+    ackTimedOut = true; linkFresh = false; ++counts.stale; event(F("ACK_TIMEOUT"));
   }
-  if (!paused && !halted && !busOffBurstRemaining && Lab::elapsed(now, lastSendAt, Lab::SAMPLE_MS)) {
+  if (!paused && !halted && Lab::elapsed(now, lastSendAt, Lab::SAMPLE_MS)) {
     lastSendAt = now;
-    uint8_t frame[8]; const uint16_t cm = Lab::simulatedDistance(nextSeq);
+    uint8_t frame[8];
+    const uint16_t cm = Lab::simulatedDistance(nextSeq);
     Lab::encode(frame, nextSeq, cm, invalidSensor ? 1 : 0, bootSession);
     if (queueFrame(Lab::SENSOR_ID, 8, frame)) {
       if (!haveSample) { lastAckAt = now; ackTimedOut = false; }
@@ -312,20 +297,19 @@ void serviceApplication(uint32_t now) {
     }
   }
 #else
-  if (spoofActive && !halted && !busOffBurstRemaining && Lab::elapsed(now, lastSpoofAt, 120)) {
-    lastSpoofAt = now;
-    sendSpoofStopFrame();
+  if (periodicTxActive && !halted && Lab::elapsed(now, lastPeriodicAt, Lab::SPOOF_INTERVAL_MS)) {
+    lastPeriodicAt = now;
+    sendStopSampleFrame();
   }
 #endif
 }
 
 void help() {
-  event(F("h help | s stats | r reinitialize controller (clears TEC/REC)"));
+  event(F("h help | s stats | r reinit CAN"));
 #if NODE_ROLE == 2
-  event(F("B: p pause/resume | i toggle sensor-fault | z duplicate | o old | m bad-DLC"));
-  event(F("For d/o/m/z: p first, wait >=250ms, then send one command"));
+  event(F("B: p pause | i fault | z zero | d dup | o old | m bad-DLC"));
 #elif NODE_ROLE == 3
-  event(F("C: 1 single spoof STOP | a continuous spoof STOP | k 60x 0xFF Bus-Off attack burst"));
+  event(F("C: 1 single frame (0x120, cm=10) | a periodic frame"));
 #endif
 }
 
@@ -336,56 +320,52 @@ void commands() {
   if (c == 's') printStats();
   if (c == 'r') {
     motorState = Lab::STOP; linkFresh = false; haveSample = false;
-    replyPending = false; haveAck = false; spoofActive = false; busOffBurstRemaining = 0;
+    replyPending = false; haveAck = false; periodicTxActive = false;
     ready = initializeCan(); lastInit = millis();
-    event(F("MANUAL_RESET: controller counters reset; software totals retained"));
+    event(F("CAN_REINIT"));
   }
 #if NODE_ROLE == 2
-  if (c == 'p') { paused = !paused; event(paused ? F("SENSOR_PAUSED") : F("SENSOR_RESUMED")); }
-  if (c == 'i') { invalidSensor = !invalidSensor; event(invalidSensor ? F("SENSOR_FAULT_ON") : F("SENSOR_FAULT_OFF")); }
+  if (c == 'p') { paused = !paused; event(paused ? F("PAUSED") : F("RESUMED")); }
+  if (c == 'i') { invalidSensor = !invalidSensor; event(invalidSensor ? F("FAULT_ON") : F("FAULT_OFF")); }
   if (c == 'z' || c == 'd' || c == 'o' || c == 'm') {
-    if (!paused || !haveSample) { event(F("FAULT_TEST: pause B after at least one sample first")); return; }
+    if (!paused || !haveSample) { event(F("PAUSE_FIRST")); return; }
     uint8_t frame[8] = {};
     if (c != 'z') Lab::encode(frame, c == 'o' ? uint16_t(lastSeq - 1) : lastSeq,
                               distanceCm, invalidSensor ? 1 : 0, bootSession);
     event(queueFrame(Lab::SENSOR_ID, c == 'm' ? 3 : 8, frame) ?
-          F("TEST_FRAME_QUEUED") : F("TEST_FRAME_BUSY_OR_HALTED"));
+          F("QUEUED") : F("BUSY_OR_HALTED"));
   }
 #elif NODE_ROLE == 3
-  if (c == '1') sendSpoofStopFrame();
+  if (c == '1') sendStopSampleFrame();
   if (c == 'a') {
-    spoofActive = !spoofActive;
-    event(spoofActive ? F("SPOOF_STOP_CONTINUOUS_ON") : F("SPOOF_STOP_CONTINUOUS_OFF"));
-  }
-  if (c == 'k') {
-    busOffBurstZeros = false;
-    busOffBurstRemaining = 60;
-    event(F("BUSOFF_ATTACK_LAUNCHED: 60x 0xFF on id=0x120 (Parrot OFF)"));
+    periodicTxActive = !periodicTxActive;
+    event(periodicTxActive ? F("PERIODIC_ON") : F("PERIODIC_OFF"));
   }
 #endif
 }
 
 void setup() {
   Serial.begin(SERIAL_SPEED);
-  // Diagnostic boot number only; two EEPROM bytes reserved at addresses 0..1.
-  // Not a cryptographic nonce and not atomic under power loss during EEPROM write.
   EEPROM.get(0, bootSession);
   bootSession = (bootSession == 0xffffU || bootSession == 0xfffeU) ? 1 : uint16_t(bootSession + 1);
   if (!bootSession) bootSession = 1;
   EEPROM.put(0, bootSession);
-  event(F("CAN LAB BASELINE: spoof STOP & Bus-Off attack ready, Parrot OFF"));
-  ready = initializeCan(); lastInit = millis(); help();
+  event(F("NODE_INIT"));
+  ready = initializeCan();
+  lastInit = millis();
+  help();
 }
 
 void loop() {
-  uint32_t now = millis(); commands();
+  uint32_t now = millis();
+  commands();
   if (!ready) {
     if (Lab::elapsed(now, lastInit, 2000)) { lastInit = now; ready = initializeCan(); }
     return;
   }
-  serviceBusOffBurst();
-  diagnostics(now); serviceTx(now); serviceBusOffBurst();
-  receiveFrames(now); serviceBusOffBurst();
+  diagnostics(now);
+  serviceTx(now);
+  receiveFrames(now);
   serviceApplication(millis());
   if (Lab::elapsed(millis(), lastStats, 2000)) { lastStats = millis(); printStats(); }
 }
